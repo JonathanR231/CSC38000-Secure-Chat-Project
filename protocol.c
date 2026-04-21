@@ -89,6 +89,58 @@ static void make_iv(const uint8_t base[16], uint64_t seq, uint8_t out[16]) {
     }
 }
 
+static int send_secure_content(int fd, session_t *s, uint8_t content_type,
+                               const uint8_t *msg, size_t msg_len) {
+    const uint8_t *enc_key = s->is_server ? s->s2c_enc : s->c2s_enc;
+    const uint8_t *mac_key = s->is_server ? s->s2c_mac : s->c2s_mac;
+    const uint8_t *iv_base = s->is_server ? s->s2c_iv_base : s->c2s_iv_base;
+    uint8_t iv[16];
+    uint8_t *ct = NULL;
+    size_t ct_len = 0;
+    uint8_t mac[32];
+    uint8_t *buf = NULL;
+    uint8_t *payload = NULL;
+    uint8_t *mp = NULL;
+    uint32_t total_len;
+    int ok = 0;
+
+    if (msg_len > SC_MAX_MSG_LEN) return 0;
+
+    payload = xmalloc(msg_len + 1);
+    payload[0] = content_type;
+    if (msg_len > 0) {
+        memcpy(payload + 1, msg, msg_len);
+    }
+
+    make_iv(iv_base, s->send_seq, iv);
+    if (!aes256ctr_crypt(enc_key, iv, payload, msg_len + 1, &ct, &ct_len)) goto out;
+
+    total_len = 1 + 8 + 16 + 4 + (uint32_t)ct_len + 32;
+    buf = xmalloc(total_len);
+    uint8_t *p = buf;
+    *p++ = PKT_DATA;
+    store_u64_be(p, s->send_seq); p += 8;
+    memcpy(p, iv, 16); p += 16;
+    store_u32_be(p, (uint32_t)ct_len); p += 4;
+    memcpy(p, ct, ct_len); p += ct_len;
+    mp = p;
+
+    if (!hmac_sha256(mac_key, 32, buf, total_len - 32, mac)) goto out;
+    memcpy(mp, mac, 32);
+    if (send_frame(fd, buf, total_len) != 0) goto out;
+
+    s->send_seq++;
+    ok = 1;
+out:
+    if (payload) {
+        secure_bzero(payload, msg_len + 1);
+        free(payload);
+    }
+    free(ct);
+    free(buf);
+    return ok;
+}
+
 static int send_client_hello(int fd, session_t *s) {
     size_t name_len = strnlen(s->my_name, SC_MAX_NAME_LEN);
     uint32_t len = 1 + 1 + 1 + 1 + 2 + 32 + 32 + (uint32_t)name_len;
@@ -280,48 +332,11 @@ int run_server_handshake(int fd, session_t *s) {
 }
 
 int send_secure_message(int fd, session_t *s, const uint8_t *msg, size_t msg_len) {
-    const uint8_t *enc_key = s->is_server ? s->s2c_enc : s->c2s_enc;
-    const uint8_t *mac_key = s->is_server ? s->s2c_mac : s->c2s_mac;
-    const uint8_t *iv_base = s->is_server ? s->s2c_iv_base : s->c2s_iv_base;
-    uint8_t iv[16];
-    uint8_t *ct = NULL;
-    size_t ct_len = 0;
-    uint8_t mac[32];
-    uint8_t *buf = NULL;
-    uint8_t *mp = NULL;
-    uint32_t total_len;
-    int ok = 0;
-
-    if (msg_len > SC_MAX_MSG_LEN) return 0;
-
-    make_iv(iv_base, s->send_seq, iv);
-    if (!aes256ctr_crypt(enc_key, iv, msg, msg_len, &ct, &ct_len)) goto out;
-
-    total_len = 1 + 8 + 16 + 4 + (uint32_t)ct_len + 32;
-    buf = xmalloc(total_len);
-    uint8_t *p = buf;
-    *p++ = PKT_DATA;
-    store_u64_be(p, s->send_seq); p += 8;
-    memcpy(p, iv, 16); p += 16;
-    store_u32_be(p, (uint32_t)ct_len); p += 4;
-    memcpy(p, ct, ct_len); p += ct_len;
-    mp = p;
-
-    if (!hmac_sha256(mac_key, 32, buf, total_len - 32, mac)) goto out;
-    memcpy(mp, mac, 32);
-    if (send_frame(fd, buf, total_len) != 0) goto out;
-
-    s->send_seq++;
-    ok = 1;
-out:
-    free(ct);
-    free(buf);
-    return ok;
+    return send_secure_content(fd, s, SC_CONTENT_CHAT, msg, msg_len);
 }
 
-int send_close_packet(int fd) {
-    uint8_t b = PKT_CLOSE;
-    return send_frame(fd, &b, 1) == 0;
+int send_close_packet(int fd, session_t *s) {
+    return send_secure_content(fd, s, SC_CONTENT_CLOSE, NULL, 0);
 }
 
 int recv_and_process_packet(int fd, session_t *s, uint8_t **msg, size_t *msg_len, int *is_close) {
@@ -333,12 +348,6 @@ int recv_and_process_packet(int fd, session_t *s, uint8_t **msg, size_t *msg_len
     *is_close = 0;
     *msg = NULL;
     *msg_len = 0;
-
-    if (buf[0] == PKT_CLOSE) {
-        *is_close = 1;
-        free(buf);
-        return 1;
-    }
 
     if (buf[0] != PKT_DATA || len < 1 + 8 + 16 + 4 + 32) {
         free(buf);
@@ -375,11 +384,32 @@ int recv_and_process_packet(int fd, session_t *s, uint8_t **msg, size_t *msg_len
         free(buf);
         return 0;
     }
+    if (pt_len < 1) {
+        free(pt);
+        free(buf);
+        return 0;
+    }
 
     s->recv_seq = seq;
     s->recv_seq_valid = 1;
-    *msg = pt;
-    *msg_len = pt_len;
+    if (pt[0] == SC_CONTENT_CLOSE) {
+        *is_close = 1;
+        secure_bzero(pt, pt_len);
+        free(pt);
+    } else if (pt[0] == SC_CONTENT_CHAT) {
+        *msg_len = pt_len - 1;
+        *msg = xmalloc(*msg_len ? *msg_len : 1);
+        if (*msg_len > 0) {
+            memcpy(*msg, pt + 1, *msg_len);
+        }
+        secure_bzero(pt, pt_len);
+        free(pt);
+    } else {
+        secure_bzero(pt, pt_len);
+        free(pt);
+        free(buf);
+        return 0;
+    }
     free(buf);
     return 1;
 }
