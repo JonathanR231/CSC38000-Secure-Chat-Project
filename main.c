@@ -63,7 +63,7 @@ static int chat_loop(int fd, session_t *s) {
                     line[--len] = '\0';
                 }
                 if (strcmp(line, "/quit") == 0) {
-                    send_close_packet(fd);
+                    send_close_packet(fd, s);
                     return 1;
                 }
                 if (!send_secure_message(fd, s, (const uint8_t *)line, len)) {
@@ -78,6 +78,7 @@ static int chat_loop(int fd, session_t *s) {
             uint8_t *msg = NULL;
             size_t msg_len = 0;
             int is_close = 0;
+
             if (!recv_and_process_packet(fd, s, &msg, &msg_len, &is_close)) {
                 fprintf(stderr, "connection closed or invalid packet\n");
                 free(msg);
@@ -88,6 +89,7 @@ static int chat_loop(int fd, session_t *s) {
                 free(msg);
                 return 1;
             }
+
             printf("\r%s: %.*s\n", s->peer_name, (int)msg_len, (char *)msg);
             fflush(stdout);
             print_prompt(s);
